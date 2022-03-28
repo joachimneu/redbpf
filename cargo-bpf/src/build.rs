@@ -185,6 +185,8 @@ fn build_probe(
         )));
     }
 
+    println!("build_probe: about to run rustc");
+
     if !Command::new(cargo)
         .current_dir(package)
         .env(env_name, env_value)
@@ -222,6 +224,8 @@ fn build_probe(
         return Err(Error::MissingBitcode(probe.to_string()));
     }
 
+    println!("build_probe: about to run llvm compile");
+
     let bc_file = bc_files.drain(..).next().unwrap();
     let opt_bc_file = bc_file.with_extension("bc.opt");
     let target_tmp = artifacts_dir.join(format!("{}.elf.tmp", probe));
@@ -231,6 +235,8 @@ fn build_probe(
             Some(format!("couldn't process IR file: {}", msg)),
         )
     })?;
+
+    println!("build_probe: starting cleanup");
 
     // stripping .debug sections, .text section and BTF sections is optional
     // process. So don't care about its failure.
@@ -250,9 +256,15 @@ fn build_probe(
         let fixed = btf::tc_legacy_fix_btf_section(elf_bytes.as_slice()).map_err(|_| Error::BTF)?;
         fs::write(&target_tmp, fixed).map_err(|e| Error::IOError(e))?;
     }
+    
+    println!("build_probe: about to strip unnecessary");
+
     let _ = llvm::strip_unnecessary(&target_tmp, contains_tc);
     let target = artifacts_dir.join(format!("{}.elf", probe));
     fs::rename(&target_tmp, &target).map_err(|e| Error::IOError(e))?;
+
+    println!("build_probe: done");
+
     Ok(())
 }
 

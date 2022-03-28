@@ -375,12 +375,19 @@ unsafe fn check_map_value_alignment(_context: LLVMContextRef, module: LLVMModule
 }
 
 pub unsafe fn compile(input: &Path, output: &Path, bc_output: Option<&Path>) -> Result<()> {
+    println!("llvm::compile: get context");
     let context = LLVMGetGlobalContext();
+    println!("llvm::compile: load_module");
     let module = load_module(context, input)?;
+    println!("llvm::compile: check alignment");
     check_map_value_alignment(context, module)?;
+    println!("llvm::compile: process ir");
     process_ir(context, module)?;
+    println!("llvm::compile: compile");
     let ret = compile_module(module, output, bc_output);
+    println!("llvm::compile: dispose");
     LLVMDisposeModule(module);
+    println!("llvm::compile: done");
 
     ret
 }
@@ -582,6 +589,9 @@ unsafe fn compile_module(
     // run module passes
     LLVMRunPassManager(mpm, module);
 
+    println!("llvm::compile_module 1");
+    println!("bc_output {:?}", bc_output);
+
     if let Some(output) = bc_output {
         let file_ptr = CString::new(output.to_str().unwrap()).unwrap().into_raw();
         let ret = LLVMWriteBitcodeToFile(module, file_ptr);
@@ -591,9 +601,15 @@ unsafe fn compile_module(
         }
     }
 
+    println!("llvm::compile_module 2");
+    println!("output {:?}", output);
+    println!("tm {:?}", tm);
+    println!("module {:?}", module);
+
     // emit the code
     let mut error = ptr::null_mut();
     let file_ptr = CString::new(output.to_str().unwrap()).unwrap().into_raw();
+    println!("llvm::compile_module 2.5");
     let ret = LLVMTargetMachineEmitToFile(
         tm,
         module,
@@ -601,6 +617,9 @@ unsafe fn compile_module(
         LLVMCodeGenFileType::LLVMObjectFile,
         &mut error,
     );
+
+    println!("llvm::compile_module 3");
+
     let _ = CString::from_raw(file_ptr);
     if ret == 1 {
         return Err(anyhow!(
@@ -608,6 +627,8 @@ unsafe fn compile_module(
             error_str(error)
         ));
     }
+
+    println!("llvm::compile_module 4");
 
     LLVMPassManagerBuilderDispose(pmb);
     LLVMDisposePassManager(fpm);
