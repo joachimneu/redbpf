@@ -61,6 +61,7 @@ use libbpf_sys::{
     bpf_load_program_xattr, bpf_map_def, bpf_map_info, bpf_prog_type, BPF_ANY, BPF_MAP_TYPE_ARRAY,
     BPF_MAP_TYPE_HASH, BPF_MAP_TYPE_LRU_HASH, BPF_MAP_TYPE_LRU_PERCPU_HASH,
     BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_PERCPU_HASH, BPF_MAP_TYPE_PERF_EVENT_ARRAY,
+    BPF_MAP_TYPE_LPM_TRIE,
     BPF_SK_LOOKUP, BPF_SK_SKB_STREAM_PARSER, BPF_SK_SKB_STREAM_VERDICT, BPF_TRACE_ITER,
 };
 
@@ -198,7 +199,7 @@ pub struct TracePoint {
 /// Type to work with `XDP` programs.
 pub struct XDP {
     common: ProgramData,
-    interfaces: Vec<String>,
+    interfaces: Vec<u32>,
 }
 
 /// Type to work with `stream_parser` BPF programs.
@@ -420,6 +421,23 @@ pub struct Array<'a, T: Clone> {
 pub struct PerCpuArray<'a, T: Clone> {
     base: &'a Map,
     _element: PhantomData<T>,
+}
+
+#[repr(C)]
+#[derive(Clone)]
+pub struct LpmTrieMapKey<T> {
+    pub prefix_len: u32,
+    pub data: T,
+}
+
+/// A BPF LPM trie map structure
+///
+/// This provides higher level API for BPF maps whose type is
+/// `BPF_MAP_TYPE_LPM_TRIE`
+pub struct LpmTrieMap<'a, K: Clone, V: Clone> {
+    base: &'a Map,
+    _k: PhantomData<K>,
+    _v: PhantomData<V>,
 }
 
 // TODO Use PERF_MAX_STACK_DEPTH
@@ -987,11 +1005,27 @@ impl XDP {
     /// # }
     /// ```
     pub fn attach_xdp(&mut self, interface: &str, flags: xdp::Flags) -> Result<()> {
+        self.attach_xdp_by_index(if_nametoindex(interface)?, flags)
+    }
+
+    /// Attach the XDP program to interface by it's index.
+    ///
+    /// Attach the XDP program to the given network interface.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use redbpf::{Module, xdp};
+    /// # let mut module = Module::parse(&std::fs::read("file.elf").unwrap()).unwrap();
+    /// # for uprobe in module.xdps_mut() {
+    /// uprobe.attach_xdp_by_index(2, xdp::Flags::default()).unwrap();
+    /// # }
+    /// ```
+    pub fn attach_xdp_by_index(&mut self, ifindex: u32, flags: xdp::Flags) -> Result<()> {
         let fd = self.common.fd.ok_or(Error::ProgramNotLoaded)?;
-        self.interfaces.push(interface.to_string());
-        if let Err(e) = unsafe { attach_xdp(interface, fd, flags as u32) } {
+        self.interfaces.push(ifindex);
+        if let Err(e) = unsafe { attach_xdp(ifindex, fd, flags as u32) } {
             if let Error::IO(oserr) = e {
-                error!("error attaching xdp to interface {}: {}", interface, oserr);
+                error!("error attaching xdp to interface #{}: {}", ifindex, oserr);
             }
             Err(Error::BPF)
         } else {
@@ -1013,18 +1047,35 @@ impl XDP {
     /// # }
     /// ```
     pub fn detach_xdp(&mut self, interface: &str) -> Result<()> {
+        self.detach_xdp_by_index(if_nametoindex(interface)?)
+    }
+
+    /// Detach the XDP program from interface by it's index.
+    ///
+    /// Detach the XDP program from the given network interface, if attached.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use redbpf::{Module, xdp};
+    /// # let mut module = Module::parse(&std::fs::read("file.elf").unwrap()).unwrap();
+    /// # for uprobe in module.xdps_mut() {
+    /// uprobe.attach_xdp_by_index(23, xdp::Flags::default()).unwrap();
+    /// uprobe.detach_xdp_by_index(23).unwrap();
+    /// # }
+    /// ```
+    pub fn detach_xdp_by_index(&mut self, ifindex: u32) -> Result<()> {
         // The linear search here isn't great, but self.interfaces will almost always be short.
         let index = self
             .interfaces
             .iter()
             .enumerate()
-            .find_map(|(i, v)| (v.as_str() == interface).then(|| i))
+            .find_map(|(i, v)| (*v == ifindex).then(|| i))
             .ok_or(Error::ProgramNotLoaded)?;
-        if let Err(e) = unsafe { detach_xdp(interface) } {
+        if let Err(e) = unsafe { detach_xdp(ifindex) } {
             if let Error::IO(ref oserr) = e {
                 error!(
-                    "error detaching xdp from interface {}: {}",
-                    interface, oserr
+                    "error detaching xdp from interface #{}: {}",
+                    ifindex, oserr
                 );
             }
             return Err(e);
@@ -1040,8 +1091,8 @@ impl XDP {
 
 impl Drop for XDP {
     fn drop(&mut self) {
-        for interface in self.interfaces.iter() {
-            let _ = unsafe { detach_xdp(interface) };
+        for ifindex in self.interfaces.iter() {
+            let _ = unsafe { detach_xdp(*ifindex) };
         }
     }
 }
@@ -1084,21 +1135,24 @@ unsafe fn open_raw_sock(name: &str) -> Result<RawFd> {
     Ok(sock)
 }
 
-unsafe fn attach_xdp(dev_name: &str, progfd: libc::c_int, flags: libc::c_uint) -> Result<()> {
+fn if_nametoindex(dev_name: &str) -> Result<u32> {
     let ciface = CString::new(dev_name).unwrap();
-    let ifindex = libc::if_nametoindex(ciface.as_ptr()) as i32;
+    let ifindex = unsafe { libc::if_nametoindex(ciface.as_ptr()) };
     if ifindex == 0 {
         return Err(Error::IO(io::Error::last_os_error()));
     }
+    Ok(ifindex)
+}
 
-    if libbpf_sys::bpf_set_link_xdp_fd(ifindex, progfd, flags) != 0 {
+unsafe fn attach_xdp(ifindex: u32, progfd: libc::c_int, flags: libc::c_uint) -> Result<()> {
+    if libbpf_sys::bpf_set_link_xdp_fd(ifindex as i32, progfd, flags) != 0 {
         return Err(Error::IO(io::Error::last_os_error()));
     }
     Ok(())
 }
 
-unsafe fn detach_xdp(dev_name: &str) -> Result<()> {
-    attach_xdp(dev_name, -1, 0)
+unsafe fn detach_xdp(ifindex: u32) -> Result<()> {
+    attach_xdp(ifindex, -1, 0)
 }
 
 impl SocketFilter {
@@ -2637,6 +2691,57 @@ impl<'a> SockMap<'a> {
         } else {
             Ok(())
         }
+    }
+}
+
+impl<'base, K: Clone, V: Clone> LpmTrieMap<'base, K, V> {
+    pub fn new(base: &'base Map) -> Result<Self> {
+        if mem::size_of::<K>() + mem::size_of::<u32>() != base.config.key_size as usize
+            || mem::size_of::<V>() != base.config.value_size as usize
+            || BPF_MAP_TYPE_LPM_TRIE != base.config.type_
+        {
+            error!(
+                "map definitions (map type and key/value size) of base `Map' and
+            `LpmTrieMap' do not match"
+            );
+            return Err(Error::Map);
+        }
+
+        Ok(Self {
+            base,
+            _k: PhantomData,
+            _v: PhantomData,
+        })
+    }
+
+    pub fn set(&self, key: LpmTrieMapKey<K>, value: V) {
+        let _ = bpf_map_set(self.base.fd, key, value);
+    }
+
+    pub fn get(&self, key: LpmTrieMapKey<K>) -> Option<V> {
+        bpf_map_get(self.base.fd, key)
+    }
+
+    pub fn delete(&self, key: LpmTrieMapKey<K>) {
+        let _ = bpf_map_delete(self.base.fd, key);
+    }
+
+    /// Return an iterator over all items in the map
+    pub fn iter<'a>(&'a self) -> MapIter<'a, LpmTrieMapKey<K>, V> {
+        MapIter {
+            iterable: self,
+            last_key: None,
+        }
+    }
+}
+
+impl<K: Clone, V: Clone> MapIterable<LpmTrieMapKey<K>, V> for LpmTrieMap<'_, K, V> {
+    fn get(&self, key: LpmTrieMapKey<K>) -> Option<V> {
+        LpmTrieMap::get(self, key)
+    }
+
+    fn next_key(&self, key: Option<LpmTrieMapKey<K>>) -> Option<LpmTrieMapKey<K>> {
+        bpf_map_get_next_key(self.base.fd, key)
     }
 }
 
